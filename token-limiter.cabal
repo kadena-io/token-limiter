@@ -26,9 +26,9 @@ common warning-flags
 
 library
   import: warning-flags
-  build-depends:       base >= 4.10 && <4.14,
+  build-depends:       base >= 4.10,
                        clock >= 0.7,
-                       ghc-prim
+                       primitive >= 0.6,
 
   -- Directories containing source files.
   hs-source-dirs:      src

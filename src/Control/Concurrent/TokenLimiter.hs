@@ -1,12 +1,19 @@
 -- | Fast rate-limiting via token bucket algorithm. Uses lock-free
 -- compare-and-swap operations on the fast path when debiting tokens.
 
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE MagicHash #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE UnboxedTuples #-}
+{-# language
+    BangPatterns
+  , DerivingStrategies
+  , DeriveGeneric
+  , GADTs
+  , MagicHash
+  , NumericUnderscores
+  , OverloadedRecordDot
+  , PackageImports
+  , TypeApplications
+  , TypeFamilies
+  , UnboxedTuples
+#-}
 
 module Control.Concurrent.TokenLimiter
   ( Count
@@ -19,19 +26,24 @@ module Control.Concurrent.TokenLimiter
   , defaultLimitConfig
   ) where
 
-import Control.Concurrent
-import Data.IORef
-import Foreign.Storable
-import GHC.Generics
-import GHC.Int
-import GHC.IO
-import GHC.Prim
-import System.Clock
+import "base" Control.Concurrent (MVar, newMVar, modifyMVar, readMVar, threadDelay)
+import "base" Data.IORef (newIORef, readIORef, writeIORef)
+import "base" GHC.Exts (Int(..), RealWorld, casIntArray#)
+import "base" GHC.Generics (Generic)
+import "base" GHC.IO (IO(..))
+import "clock" System.Clock (TimeSpec, Clock(..), getTime, toNanoSecs, fromNanoSecs)
+import "primitive" Data.Primitive.PrimArray (MutablePrimArray(..), newPrimArray, readPrimArray, writePrimArray)
+import "primitive" Data.Primitive.Types (sizeOf)
 
 type Count = Int
 
-data LimitConfig = LimitConfig {
-    maxBucketTokens :: {-# UNPACK #-} !Count
+casIntArray :: MutablePrimArray RealWorld Int -> Int -> Int -> Int -> IO Int
+casIntArray (MutablePrimArray marr#) (I# a#) (I# b#) (I# c#) =
+  IO $ \s0# -> case casIntArray# marr# a# b# c# s0# of
+    (# s1#, i# #) -> (# s1#, I# i# #)
+
+data LimitConfig = LimitConfig
+  { maxBucketTokens :: {-# UNPACK #-} !Count
       -- ^ maximum number of tokens the bucket can hold at any one time.
   , initialBucketTokens :: {-# UNPACK #-} !Count
       -- ^ how many tokens should be in the bucket when it's created.
@@ -43,13 +55,8 @@ data LimitConfig = LimitConfig {
   , delayAction :: TimeSpec -> IO ()
       -- ^ action to delay for the given time interval. 'defaultLimitConfig'
       -- forwards to 'threadDelay'. Provided for mocking.
-  } deriving (Generic)
-
-data RateLimiter = RateLimiter {
-    _bucketTokens :: !(MutableByteArray# RealWorld)
-  , _bucketLastServiced :: {-# UNPACK #-} !(MVar TimeSpec)
   }
-
+  deriving stock (Generic)
 
 defaultLimitConfig :: LimitConfig
 defaultLimitConfig = LimitConfig 5 1 1 nowIO sleepIO
@@ -57,30 +64,28 @@ defaultLimitConfig = LimitConfig 5 1 1 nowIO sleepIO
     nowIO = getTime Monotonic
     sleepIO x = threadDelay $! fromInteger (toNanoSecs x `div` 1000)
 
+data RateLimiter = RateLimiter
+  { bucketTokens :: {-# UNPACK #-} !(MutablePrimArray RealWorld Int)
+  , bucketLastServiced :: {-# UNPACK #-} !(MVar TimeSpec)
+  }
 
 newRateLimiter :: LimitConfig -> IO RateLimiter
 newRateLimiter lc = do
-    !now <- nowIO
-    !mv <- newMVar now
-    mk mv
-  where
-    initial = initialBucketTokens lc
-    nowIO = clockAction lc
-    !(I# initial#) = initial
-    !(I# nbytes#) = sizeOf $! initial
-    mk mv = IO $ \s# ->
-            case newByteArray# nbytes# s# of
-              (# s1#, arr# #) -> case writeIntArray# arr# 0# initial# s1# of
-                s2# -> (# s2#, RateLimiter arr# mv #)
+    now <- lc.clockAction
+    lastServiced <- newMVar now
+    let initial = lc.initialBucketTokens
+    arr <- newPrimArray @_ @Int (sizeOf initial)
+    writePrimArray arr 0 initial
+    pure $ RateLimiter
+      { bucketTokens = arr
+      , bucketLastServiced = lastServiced
+      }
 
 rateToNsPer :: Integral a => a -> a
-rateToNsPer tps = 1000000000 `div` tps
+rateToNsPer tps = 1_000_000_000 `div` tps
 
-readBucket :: MutableByteArray# RealWorld -> IO Int
-readBucket bucket# = IO $ \s# ->
-                     case readIntArray# bucket# 0# s# of
-                       (# s1#, w# #) -> (# s1#, I# w# #)
-
+readBucket :: MutablePrimArray RealWorld Int -> IO Int
+readBucket bucket = readPrimArray bucket 0
 
 -- | Unconditionally debit this amount of tokens from the rate limiter, driving
 -- it negative if necessary. Returns the new bucket balance.
@@ -89,64 +94,57 @@ readBucket bucket# = IO $ \s# ->
 penalize :: RateLimiter -> Count -> IO Count
 penalize rl delta = addLoop
   where
-    bucket# = _bucketTokens rl
-    rdBucket = readBucket bucket#
     addLoop = do
-        !b@(I# bb#) <- rdBucket
-        let !ibb'@(I# bb'#) = b - delta
-        IO $ \s# -> case casIntArray# bucket# 0# bb# bb'# s# of
-                      (# s1#, prev# #) -> if (I# prev#) == b
-                                             then (# s1#, ibb' #)
-                                             else let (IO f) = addLoop in f s1#
-
+      x <- readBucket rl.bucketTokens
+      let x' = x - delta
+      prev <- casIntArray rl.bucketTokens 0 x x'
+      if prev == x
+      then pure x'
+      else addLoop
 
 -- | Attempt to pull the given number of tokens from the bucket. Returns 'True'
 -- if the tokens were successfully debited.
 tryDebit :: LimitConfig -> RateLimiter -> Count -> IO Bool
 tryDebit cfg rl cnt = do
-    let nowIO = clockAction cfg
+    let nowIO = cfg.clockAction
     snd <$> tryDebit' nowIO cfg rl cnt
-
 
 tryDebit' :: IO TimeSpec -> LimitConfig -> RateLimiter -> Count -> IO (Int, Bool)
 tryDebit' nowIO cfg rl ndebits = tryGrab
   where
-    bucket# = _bucketTokens rl
-    mv = _bucketLastServiced rl
-    maxTokens = maxBucketTokens cfg
-    refillRate = bucketRefillTokensPerSecond cfg
-    rdBucket = readBucket bucket#
+    --bucket# = _bucketTokens rl
+    --mv = _bucketLastServiced rl
+    --maxTokens = maxBucketTokens cfg
+    --refillRate = bucketRefillTokensPerSecond cfg
 
     tryGrab = do
-        !nt <- rdBucket
+        !nt <- readBucket rl.bucketTokens
         if nt >= ndebits
           then tryCas nt (nt - ndebits)
           else fetchMore nt
 
-    tryCas !nt@(I# nt#) !newval@(I# newVal#) =
-        IO $ \s# -> case casIntArray# bucket# 0# nt# newVal# s# of
-                      (# s1#, prevV# #) -> let prevV = I# prevV#
-                                               rest = if prevV == nt
-                                                        then return (newval, True)
-                                                        else tryGrab
-                                               (IO restF) = rest
-                                           in restF s1#
+    --tryCas :: Int -> Int -> IO (Int, Bool)
+    tryCas nt newVal = do
+      prevV <- casIntArray rl.bucketTokens 0 nt newVal
+      if prevV == nt
+      then pure (newVal, True)
+      else tryGrab
 
     addLoop !numNewTokens = go
       where
         go = do
-            !b@(I# bb#) <- rdBucket
-            let !ibb'@(I# bb'#) = min (fromIntegral maxTokens) (b + numNewTokens)
-            IO $ \s# -> case casIntArray# bucket# 0# bb# bb'# s# of
-                          (# s1#, prev# #) -> if (I# prev#) == b
-                                                 then (# s1#, ibb' #)
-                                                 else let (IO f) = go in f s1#
+          b <- readBucket rl.bucketTokens
+          let b' = min (fromIntegral cfg.maxBucketTokens) (b + numNewTokens)
+          prev <- casIntArray rl.bucketTokens 0 b b'
+          if prev == b
+          then pure b'
+          else go
 
     fetchMore !nt = do
-        newBalance <- modifyMVar mv $ \lastUpdated -> do
+        newBalance <- modifyMVar rl.bucketLastServiced $ \lastUpdated -> do
             now <- nowIO
             let !numNanos = toNanoSecs $ now - lastUpdated
-            let !nanosPerToken = toInteger $ rateToNsPer refillRate
+            let !nanosPerToken = toInteger $ rateToNsPer cfg.bucketRefillTokensPerSecond
             let !numNewTokens0 = numNanos `div` nanosPerToken
             let numNewTokens = fromIntegral numNewTokens0
             let !lastUpdated' = lastUpdated +
@@ -158,7 +156,6 @@ tryDebit' nowIO cfg rl ndebits = tryGrab
         if newBalance >= ndebits
           then tryGrab
           else return (newBalance, False)
-
 
 waitForTokens :: TimeSpec -> LimitConfig -> RateLimiter -> Count -> Count -> IO ()
 waitForTokens now cfg (RateLimiter _ mv) balance ntokens = do
@@ -174,7 +171,6 @@ waitForTokens now cfg (RateLimiter _ mv) balance ntokens = do
     refillRate = bucketRefillTokensPerSecond cfg
     sleepFor = delayAction cfg
 
-
 -- | Attempt to pull /k/ tokens from the bucket, sleeping in a loop until they
 -- become available. Will not partially fulfill token requests (i.e. it loops
 -- until the entire allotment is available in one swoop), and makes no attempt
@@ -186,15 +182,18 @@ waitDebit lc rl ndebits = go
     cacheClock ref = do
         m <- readIORef ref
         case m of
-          Nothing -> do !now <- clockAction lc
-                        writeIORef ref (Just now)
-                        return now
-          (Just t) -> return t
+          Nothing -> do
+            !now <- clockAction lc
+            writeIORef ref (Just now)
+            return now
+          Just t -> return t
     go = do
         ref <- newIORef Nothing
         let clock = cacheClock ref
         (balance, b) <- tryDebit' clock lc rl ndebits
         if b
-          then return $! ()
-          else do now <- clock
-                  waitForTokens now lc rl balance ndebits >> go
+          then do
+            return ()
+          else do
+            now <- clock
+            waitForTokens now lc rl balance ndebits >> go
