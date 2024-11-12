@@ -112,11 +112,6 @@ tryDebit cfg rl cnt = do
 tryDebit' :: IO TimeSpec -> LimitConfig -> RateLimiter -> Count -> IO (Int, Bool)
 tryDebit' nowIO cfg rl ndebits = tryGrab
   where
-    --bucket# = _bucketTokens rl
-    --mv = _bucketLastServiced rl
-    --maxTokens = maxBucketTokens cfg
-    --refillRate = bucketRefillTokensPerSecond cfg
-
     tryGrab = do
         !nt <- readBucket rl.bucketTokens
         if nt >= ndebits
