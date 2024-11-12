@@ -6,16 +6,16 @@ description:         Fast rate limiting using the token bucket algorithm. BSD-li
 license:             BSD-2-Clause
 license-file:        LICENSE
 author:              Gregory Collins
-maintainer:          greg@gregorycollins.net
+maintainer:          kadena-io
 copyright:           Copyright (C) 2019 Kadena LLC
 category:            Concurrency
 extra-source-files:  CHANGELOG.md
-homepage:            https://github.com/gregorycollins/token-limiter
-bug-reports:         https://github.com/gregorycollins/token-limiter/issues
+homepage:            https://github.com/kadena-io/token-limiter
+bug-reports:         https://github.com/kadena-io/token-limiter/issues
 
 source-repository head
     type: git
-    location: https://github.com/gregorycollins/token-limiter.git
+    location: https://github.com/kadena-io/token-limiter.git
 
 common warning-flags
     ghc-options:
